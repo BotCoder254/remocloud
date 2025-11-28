@@ -7,9 +7,9 @@ const { validateSignedUrl, setCacheHeaders } = require('../middleware/cdn');
 const router = express.Router();
 
 // Serve files via CDN with signed URL validation
-router.get('/:objectKey(*)', validateSignedUrl, setCacheHeaders, async (req, res) => {
+router.get('/:objectKey', validateSignedUrl, setCacheHeaders, async (req, res) => {
   try {
-    const { objectKey } = req.cdnAuth;
+    const objectKey = req.params.objectKey || req.cdnAuth?.objectKey;
     
     // Check if this is a derivative first
     let derivativeResult = await pool.query(
@@ -101,9 +101,9 @@ router.get('/:objectKey(*)', validateSignedUrl, setCacheHeaders, async (req, res
 });
 
 // Serve public files without authentication
-router.get('/public/:objectKey(*)', setCacheHeaders, async (req, res) => {
+router.get('/public/:objectKey', setCacheHeaders, async (req, res) => {
   try {
-    const { objectKey } = req.params;
+    const objectKey = req.params.objectKey;
     
     // Find public file by object key
     const result = await pool.query(
