@@ -450,7 +450,7 @@ router.get('/:fileId/preview', async (req, res) => {
     
     const result = await pool.query(
       'SELECT * FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, decoded.id]
+      [fileId, decoded.userId]
     );
 
     const file = result.rows[0];
@@ -479,6 +479,30 @@ router.get('/:fileId/preview', async (req, res) => {
   }
 });
 
+// Debug endpoint to list all files for user
+router.get('/debug/list', async (req, res) => {
+  try {
+    const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const jwt = require('jsonwebtoken');
+    const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    const result = await pool.query(
+      'SELECT id, filename, original_name, size, mime_type, created_at FROM files WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+      [decoded.userId]
+    );
+
+    res.json({ files: result.rows, userId: decoded.userId });
+  } catch (error) {
+    console.error('Debug list error:', error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
 // Direct download endpoint
 router.get('/:fileId/download', async (req, res) => {
   try {
@@ -497,8 +521,8 @@ router.get('/:fileId/download', async (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     
     const result = await pool.query(
-      'SELECT * FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, decoded.id]
+      'SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      [fileId, decoded.userId]
     );
 
     const file = result.rows[0];
@@ -507,8 +531,11 @@ router.get('/:fileId/download', async (req, res) => {
     }
 
     const filePath = path.join(__dirname, '../uploads', file.filename);
+    console.log(`Looking for file at: ${filePath}`);
     
     if (!fs.existsSync(filePath)) {
+      console.log(`File not found on disk: ${filePath}`);
+      console.log(`File record:`, { id: file.id, filename: file.filename, original_name: file.original_name });
       return res.status(404).json({ error: 'File not found on disk' });
     }
 
