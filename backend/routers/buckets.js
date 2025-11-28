@@ -1,17 +1,8 @@
 const express = require('express');
 const { pool } = require('../models/database');
-const { authenticateUser, authenticateApiKey } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 
 const router = express.Router();
-
-// Middleware to handle both auth types
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader?.includes('rk_')) {
-    return authenticateApiKey(req, res, next);
-  }
-  return authenticateUser(req, res, next);
-};
 
 // Helper function to generate slug from name
 const generateSlug = (name) => {
@@ -40,7 +31,7 @@ router.get('/', authenticate, async (req, res) => {
       ) f ON b.id = f.bucket_id
       WHERE b.user_id = $1 AND b.deleted_at IS NULL
       ORDER BY b.created_at DESC
-    `, [req.user.userId]);
+    `, [req.user.id]);
     
     res.json(result.rows);
   } catch (error) {
@@ -68,7 +59,7 @@ router.post('/', authenticate, async (req, res) => {
       INSERT INTO buckets (user_id, name, slug, is_public_by_default, versioning_enabled, allowed_types) 
       VALUES ($1, $2, $3, $4, $5, $6) 
       RETURNING *
-    `, [req.user.userId, name, slug, is_public_by_default, versioning_enabled, allowed_types]);
+    `, [req.user.id, name, slug, is_public_by_default, versioning_enabled, allowed_types]);
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -99,7 +90,7 @@ router.get('/:bucketId', authenticate, async (req, res) => {
         GROUP BY bucket_id
       ) f ON b.id = f.bucket_id
       WHERE b.id = $1 AND b.user_id = $2 AND b.deleted_at IS NULL
-    `, [bucketId, req.user.userId]);
+    `, [bucketId, req.user.id]);
 
     if (!result.rows[0]) {
       return res.status(404).json({ error: 'Bucket not found' });
@@ -155,7 +146,7 @@ router.put('/:bucketId', authenticate, async (req, res) => {
     }
 
     updates.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(bucketId, req.user.userId);
+    values.push(bucketId, req.user.id);
 
     const result = await pool.query(`
       UPDATE buckets 
@@ -187,7 +178,7 @@ router.delete('/:bucketId', authenticate, async (req, res) => {
       SET deleted_at = CURRENT_TIMESTAMP 
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
       RETURNING id
-    `, [bucketId, req.user.userId]);
+    `, [bucketId, req.user.id]);
 
     if (!result.rows[0]) {
       return res.status(404).json({ error: 'Bucket not found' });
@@ -213,7 +204,7 @@ router.get('/:bucketId/stats', authenticate, async (req, res) => {
         MAX(created_at) as last_upload
       FROM files 
       WHERE bucket_id = $1 AND user_id = $2
-    `, [bucketId, req.user.userId]);
+    `, [bucketId, req.user.id]);
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -234,7 +225,7 @@ router.post('/:bucketId/check-duplicate', authenticate, async (req, res) => {
     // Verify bucket access
     const bucketResult = await pool.query(
       'SELECT id FROM buckets WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
-      [bucketId, req.user.userId]
+      [bucketId, req.user.id]
     );
 
     if (!bucketResult.rows[0]) {
@@ -247,7 +238,7 @@ router.post('/:bucketId/check-duplicate', authenticate, async (req, res) => {
       FROM files 
       WHERE bucket_id = $1 AND user_id = $2 AND file_hash = $3 AND deleted_at IS NULL
       ORDER BY created_at DESC
-    `, [bucketId, req.user.userId, hash.toLowerCase()]);
+    `, [bucketId, req.user.id, hash.toLowerCase()]);
 
     const duplicates = duplicateResult.rows;
     

@@ -47,47 +47,24 @@ export class DownloadService {
     });
   }
 
-  // Download file using signed URL
+  // Download file using direct endpoint
   async downloadFile(fileId, filename, options = {}) {
     try {
-      const urlData = await this.getDownloadUrl(fileId, { 
-        ...options, 
-        purpose: 'download' 
-      });
-
-      // For public files or direct download
-      if (urlData.isPublic || options.direct) {
-        const link = document.createElement('a');
-        link.href = urlData.url;
-        link.download = filename;
-        link.target = '_blank';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        return;
+      // Use direct download endpoint with token in URL
+      const token = localStorage.getItem('token');
+      if (!token) {
+        throw new Error('No authentication token found');
       }
 
-      // For private files, fetch and create blob URL
-      const response = await fetch(urlData.url, {
-        headers: urlData.cacheHeaders || {}
-      });
-
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
+      const downloadUrl = `${process.env.REACT_APP_API_URL || 'http://localhost:5000/api'}/files/${fileId}/download?token=${encodeURIComponent(token)}`;
       
       const link = document.createElement('a');
-      link.href = blobUrl;
+      link.href = downloadUrl;
       link.download = filename;
+      link.target = '_blank';
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      
-      // Clean up blob URL
-      window.URL.revokeObjectURL(blobUrl);
     } catch (error) {
       console.error('Download failed:', error);
       throw error;

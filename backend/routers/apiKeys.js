@@ -11,7 +11,7 @@ router.get('/', authenticateUser, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT id, name, scopes, created_at, last_used_at, revoked_at FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user.userId]
+      [req.user.id]
     );
     res.json(result.rows);
   } catch (error) {
@@ -33,7 +33,7 @@ router.post('/', authenticateUser, async (req, res) => {
 
     const result = await pool.query(
       'INSERT INTO api_keys (user_id, key_hash, name, scopes) VALUES ($1, $2, $3, $4) RETURNING id, name, scopes, created_at',
-      [req.user.userId, keyHash, name, scopes]
+      [req.user.id, keyHash, name, scopes]
     );
 
     const apiKey = result.rows[0];
@@ -54,7 +54,7 @@ router.delete('/:keyId', authenticateUser, async (req, res) => {
     
     const result = await pool.query(
       'UPDATE api_keys SET revoked_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2 RETURNING id',
-      [keyId, req.user.userId]
+      [keyId, req.user.id]
     );
 
     if (!result.rows[0]) {

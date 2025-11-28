@@ -3,6 +3,7 @@ import { motion } from 'framer-motion';
 import { Mail, Lock, Eye, EyeOff } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { authService } from '../services/auth';
+import { useAuth } from '../contexts/AuthContext';
 
 const Login = () => {
   const [email, setEmail] = useState('');
@@ -12,6 +13,7 @@ const Login = () => {
   const [error, setError] = useState('');
   
   const navigate = useNavigate();
+  const { login } = useAuth();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -19,11 +21,12 @@ const Login = () => {
     setError('');
 
     try {
-      await authService.login(email, password);
-      navigate('/dashboard');
+      const { user, token } = await authService.login(email, password);
+      login(user, token);
+      window.location.href = '/dashboard';
     } catch (error) {
+      console.error('Login error:', error);
       setError(error.response?.data?.error || 'Login failed');
-    } finally {
       setIsLoading(false);
     }
   };

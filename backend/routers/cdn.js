@@ -9,6 +9,11 @@ const router = express.Router();
 // Serve files via CDN with signed URL validation
 router.get('/:objectKey', validateSignedUrl, setCacheHeaders, async (req, res) => {
   try {
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control');
+    
     const objectKey = req.params.objectKey || req.cdnAuth?.objectKey;
     
     // Check if this is a derivative first
@@ -103,6 +108,11 @@ router.get('/:objectKey', validateSignedUrl, setCacheHeaders, async (req, res) =
 // Serve public files without authentication
 router.get('/public/:objectKey', setCacheHeaders, async (req, res) => {
   try {
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control');
+    
     const objectKey = req.params.objectKey;
     
     // Find public file by object key

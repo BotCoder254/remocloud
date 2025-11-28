@@ -1,6 +1,6 @@
 const express = require('express');
 const { pool } = require('../models/database');
-const { authenticateApiKey } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const imageTransform = require('../utils/imageTransform');
 const fs = require('fs').promises;
 const path = require('path');
@@ -9,18 +9,17 @@ const crypto = require('crypto');
 const router = express.Router();
 
 // Get transformed image
-router.get('/files/:fileId/transform', authenticateApiKey, async (req, res) => {
+router.get('/files/:fileId/transform', authenticate, async (req, res) => {
   try {
     const { fileId } = req.params;
     const { w, h, q, format, preset } = req.query;
 
-    // Get file info
+    // Get file info and verify user access
     const fileResult = await pool.query(`
-      SELECT f.*, fv.object_key, fv.mime_type, fv.size, fv.id as version_id
+      SELECT f.*, f.filename, f.object_key, f.mime_type, f.size, f.id as version_id
       FROM files f
-      JOIN file_versions fv ON f.current_version_id = fv.id
-      WHERE f.id = $1 AND f.deleted_at IS NULL
-    `, [fileId]);
+      WHERE f.id = $1 AND f.user_id = $2 AND f.deleted_at IS NULL
+    `, [fileId, req.user.id]);
 
     if (fileResult.rows.length === 0) {
       return res.status(404).json({ error: 'File not found' });
@@ -57,8 +56,8 @@ router.get('/files/:fileId/transform', authenticateApiKey, async (req, res) => {
     // Check if derivative already exists
     const derivativeResult = await pool.query(`
       SELECT * FROM image_derivatives 
-      WHERE file_version_id = $1 AND transform_key = $2
-    `, [file.version_id, transformKey]);
+      WHERE file_id = $1 AND transform_key = $2
+    `, [file.id, transformKey]);
 
     let derivative;
     if (derivativeResult.rows.length > 0) {
@@ -104,20 +103,19 @@ router.get('/transform/presets', (req, res) => {
 });
 
 // Generate srcset for responsive images
-router.get('/files/:fileId/srcset', authenticateApiKey, async (req, res) => {
+router.get('/files/:fileId/srcset', authenticate, async (req, res) => {
   try {
     const { fileId } = req.params;
     const { breakpoints = '300,600,900,1200', format = 'webp' } = req.query;
 
     const breakpointArray = breakpoints.split(',').map(b => parseInt(b.trim()));
     
-    // Get file info
+    // Get file info and verify user access
     const fileResult = await pool.query(`
-      SELECT f.*, fv.object_key, fv.mime_type
+      SELECT f.*, f.object_key, f.mime_type
       FROM files f
-      JOIN file_versions fv ON f.current_version_id = fv.id
-      WHERE f.id = $1 AND f.deleted_at IS NULL
-    `, [fileId]);
+      WHERE f.id = $1 AND f.user_id = $2 AND f.deleted_at IS NULL
+    `, [fileId, req.user.id]);
 
     if (fileResult.rows.length === 0) {
       return res.status(404).json({ error: 'File not found' });
@@ -138,8 +136,8 @@ router.get('/files/:fileId/srcset', authenticateApiKey, async (req, res) => {
         // Check if derivative exists, create if not
         let derivative = await pool.query(`
           SELECT * FROM image_derivatives 
-          WHERE file_version_id = $1 AND transform_key = $2
-        `, [file.version_id, transformKey]);
+          WHERE file_id = $1 AND transform_key = $2
+        `, [file.id, transformKey]);
 
         if (derivative.rows.length === 0) {
           derivative = await generateDerivative(file, transformParams, transformKey);
@@ -174,16 +172,16 @@ router.get('/files/:fileId/srcset', authenticateApiKey, async (req, res) => {
 // Helper function to generate derivative
 async function generateDerivative(file, transformParams, transformKey) {
   try {
-    // Read original file
+    // Read original file - use filename instead of object_key
     const uploadsDir = path.join(__dirname, '../uploads');
-    const filePath = path.join(uploadsDir, file.object_key);
+    const filePath = path.join(uploadsDir, file.filename);
     const inputBuffer = await fs.readFile(filePath);
 
     // Apply transforms
     const result = await imageTransform.transformImage(inputBuffer, transformParams);
 
     // Generate derivative object key
-    const derivativeKey = imageTransform.generateDerivativeKey(file.object_key, transformKey);
+    const derivativeKey = imageTransform.generateDerivativeKey(file.filename, transformKey);
     const derivativePath = path.join(uploadsDir, derivativeKey);
 
     // Ensure directory exists
@@ -195,13 +193,12 @@ async function generateDerivative(file, transformParams, transformKey) {
     // Store derivative metadata in database
     const derivativeResult = await pool.query(`
       INSERT INTO image_derivatives (
-        file_id, file_version_id, transform_spec, transform_key, 
+        file_id, transform_spec, transform_key, 
         object_key, mime_type, size, width, height, quality, format
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *
     `, [
       file.id,
-      file.version_id,
       JSON.stringify(transformParams),
       transformKey,
       derivativeKey,
@@ -224,16 +221,15 @@ async function generateDerivative(file, transformParams, transformKey) {
 // Helper function to generate signed URL
 function generateSignedUrl(objectKey, purpose, expiry) {
   const secret = process.env.CDN_SECRET || 'default-secret';
-  const expires = Math.floor(Date.now() / 1000) + expiry;
+  const expires = Date.now() + (expiry * 1000);
   
-  const payload = `${objectKey}:${purpose}:${expires}`;
   const signature = crypto
     .createHmac('sha256', secret)
-    .update(payload)
+    .update(`${objectKey}:${expires}:${purpose}`)
     .digest('hex');
 
-  const baseUrl = process.env.CDN_BASE_URL || 'http://localhost:5000/cdn';
-  return `${baseUrl}/${objectKey}?expires=${expires}&signature=${signature}&purpose=${purpose}`;
+  const baseUrl = process.env.API_BASE_URL || 'http://localhost:5000';
+  return `${baseUrl}/cdn/${objectKey}?expires=${expires}&signature=${signature}&purpose=${purpose}`;
 }
 
 module.exports = router;

@@ -4,19 +4,10 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../models/database');
-const { authenticateUser, authenticateApiKey } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const analyticsService = require('../utils/analytics');
 
 const router = express.Router();
-
-// Middleware to handle both auth types
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader?.includes('rk_')) {
-    return authenticateApiKey(req, res, next);
-  }
-  return authenticateUser(req, res, next);
-};
 
 // Get files with pagination, filtering, and search
 router.get('/', authenticate, async (req, res) => {
@@ -49,7 +40,7 @@ router.get('/', authenticate, async (req, res) => {
     if (!includeDeleted || includeDeleted === 'false') {
       query += ` AND f.deleted_at IS NULL`;
     }
-    let params = [req.user.userId];
+    let params = [req.user.id];
     let paramCount = 1;
 
     // Bucket filter
@@ -159,7 +150,7 @@ router.get('/buckets/:bucketId', authenticate, async (req, res) => {
     // Verify bucket access
     const bucketResult = await pool.query(
       'SELECT id FROM buckets WHERE id = $1 AND user_id = $2',
-      [bucketId, req.user.userId]
+      [bucketId, req.user.id]
     );
 
     if (!bucketResult.rows[0]) {
@@ -173,7 +164,7 @@ router.get('/buckets/:bucketId', authenticate, async (req, res) => {
       LEFT JOIN users u ON f.created_by = u.id
       WHERE f.bucket_id = $1 AND f.user_id = $2
     `;
-    let params = [bucketId, req.user.userId];
+    let params = [bucketId, req.user.id];
     let paramCount = 2;
 
     // Search and filters (same as above)
@@ -246,7 +237,7 @@ router.get('/:fileId', authenticate, async (req, res) => {
       LEFT JOIN buckets b ON f.bucket_id = b.id
       LEFT JOIN users u ON f.created_by = u.id
       WHERE f.id = $1 AND f.user_id = $2
-    `, [fileId, req.user.userId]);
+    `, [fileId, req.user.id]);
 
     const file = result.rows[0];
     if (!file) {
@@ -304,7 +295,7 @@ router.put('/:fileId', authenticate, async (req, res) => {
     }
 
     updates.push(`updated_at = CURRENT_TIMESTAMP`);
-    values.push(fileId, req.user.userId);
+    values.push(fileId, req.user.id);
 
     const result = await pool.query(`
       UPDATE files 
@@ -347,7 +338,7 @@ router.post('/upload', authenticate, multer().single('file'), async (req, res) =
     // Get bucket settings
     const bucketResult = await pool.query(
       'SELECT is_public_by_default FROM buckets WHERE id = $1 AND user_id = $2',
-      [bucket_id, req.user.userId]
+      [bucket_id, req.user.id]
     );
 
     if (!bucketResult.rows[0]) {
@@ -363,14 +354,14 @@ router.post('/upload', authenticate, multer().single('file'), async (req, res) =
       RETURNING *
     `, [
       bucket_id,
-      req.user.userId,
+      req.user.id,
       req.file.filename,
       req.file.originalname,
       req.file.mimetype,
       req.file.size,
       req.file.path,
       isPublic,
-      req.user.userId
+      req.user.id
     ]);
 
     res.status(201).json(result.rows[0]);
@@ -390,7 +381,7 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
       FROM files f
       JOIN buckets b ON f.bucket_id = b.id
       WHERE f.id = $1 AND f.user_id = $2
-    `, [fileId, req.user.userId]);
+    `, [fileId, req.user.id]);
 
     const file = result.rows[0];
     if (!file) {
@@ -426,7 +417,7 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
       : { 'Cache-Control': 'private, max-age=900' };   // 15 minutes for current files
 
     // Track download analytics
-    await analyticsService.trackDownload(req.user.userId, file.bucket_id, file.size);
+    await analyticsService.trackDownload(req.user.id, file.bucket_id, file.size);
 
     res.json({
       url: signedUrl,
@@ -440,14 +431,26 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
   }
 });
 
-// Legacy download endpoint (fallback)
-router.get('/:fileId/download', authenticate, async (req, res) => {
+// Simple preview endpoint for images
+router.get('/:fileId/preview', async (req, res) => {
   try {
     const { fileId } = req.params;
     
+    // Get token from query or header for image requests
+    const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    // Verify token
+    const jwt = require('jsonwebtoken');
+    const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
     const result = await pool.query(
       'SELECT * FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, req.user.userId]
+      [fileId, decoded.id]
     );
 
     const file = result.rows[0];
@@ -461,12 +464,66 @@ router.get('/:fileId/download', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'File not found on disk' });
     }
 
-    res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`);
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Disposition', `inline; filename="${file.original_name}"`);
+    res.setHeader('Cache-Control', 'private, max-age=300');
     
     const fileStream = fs.createReadStream(filePath);
     fileStream.pipe(res);
   } catch (error) {
+    console.error('Preview error:', error);
+    res.status(500).json({ error: 'Failed to serve preview' });
+  }
+});
+
+// Direct download endpoint
+router.get('/:fileId/download', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    // Get token from query or header
+    const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    // Verify token
+    const jwt = require('jsonwebtoken');
+    const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    const result = await pool.query(
+      'SELECT * FROM files WHERE id = $1 AND user_id = $2',
+      [fileId, decoded.id]
+    );
+
+    const file = result.rows[0];
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const filePath = path.join(__dirname, '../uploads', file.filename);
+    
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+    res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`);
+    res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Length', file.size);
+    
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+  } catch (error) {
+    console.error('Download error:', error);
     res.status(500).json({ error: 'Failed to download file' });
   }
 });
@@ -511,7 +568,7 @@ router.delete('/:fileId', authenticate, async (req, res) => {
       // Permanent delete (admin only or after retention period)
       const result = await pool.query(
         'DELETE FROM files WHERE id = $1 AND user_id = $2 RETURNING filename, size, bucket_id',
-        [fileId, req.user.userId]
+        [fileId, req.user.id]
       );
 
       const file = result.rows[0];
@@ -533,7 +590,7 @@ router.delete('/:fileId', authenticate, async (req, res) => {
       `, [file.size, file.bucket_id]);
 
       // Track delete analytics
-      await analyticsService.trackDelete(req.user.userId, file.bucket_id, file.size);
+      await analyticsService.trackDelete(req.user.id, file.bucket_id, file.size);
 
       res.json({ message: 'File permanently deleted' });
     } else {
@@ -547,7 +604,7 @@ router.delete('/:fileId', authenticate, async (req, res) => {
             restore_until = $2
         WHERE id = $3 AND user_id = $1 AND deleted_at IS NULL
         RETURNING *
-      `, [req.user.userId, restoreUntil, fileId]);
+      `, [req.user.id, restoreUntil, fileId]);
 
       if (!result.rows[0]) {
         return res.status(404).json({ error: 'File not found or already deleted' });
@@ -578,7 +635,7 @@ router.post('/:fileId/restore', authenticate, async (req, res) => {
           updated_at = CURRENT_TIMESTAMP
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL AND restore_until > CURRENT_TIMESTAMP
       RETURNING *
-    `, [fileId, req.user.userId]);
+    `, [fileId, req.user.id]);
 
     if (!result.rows[0]) {
       return res.status(404).json({ error: 'File not found or restore period expired' });
@@ -602,7 +659,7 @@ router.get('/:fileId/versions', authenticate, async (req, res) => {
     // Verify file access
     const fileResult = await pool.query(
       'SELECT id FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, req.user.userId]
+      [fileId, req.user.id]
     );
 
     if (!fileResult.rows[0]) {
@@ -637,7 +694,7 @@ router.post('/:fileId/versions/:versionId/restore', authenticate, async (req, re
     // Verify file access
     const fileResult = await pool.query(
       'SELECT * FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, req.user.userId]
+      [fileId, req.user.id]
     );
 
     if (!fileResult.rows[0]) {
@@ -679,7 +736,7 @@ router.post('/:fileId/versions/:versionId/restore', authenticate, async (req, re
       version.object_key,
       version.file_hash,
       version.metadata_json,
-      req.user.userId,
+      req.user.id,
       version.version_number
     ]);
 
@@ -732,7 +789,7 @@ router.get('/:fileId/hash', authenticate, async (req, res) => {
     
     const result = await pool.query(
       'SELECT file_hash, original_name, size FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, req.user.userId]
+      [fileId, req.user.id]
     );
 
     const file = result.rows[0];
@@ -761,7 +818,7 @@ router.post('/:fileId/verify', authenticate, async (req, res) => {
     
     const result = await pool.query(
       'SELECT file_hash, filename, original_name FROM files WHERE id = $1 AND user_id = $2',
-      [fileId, req.user.userId]
+      [fileId, req.user.id]
     );
 
     const file = result.rows[0];

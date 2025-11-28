@@ -2,21 +2,12 @@ const express = require('express');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../models/database');
-const { authenticateUser, authenticateApiKey } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const FileValidationService = require('../utils/fileValidation');
 const analyticsService = require('../utils/analytics');
 const { createError, asyncHandler } = require('../utils/errors');
 
 const router = express.Router();
-
-// Middleware to handle both auth types
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader?.includes('rk_')) {
-    return authenticateApiKey(req, res, next);
-  }
-  return authenticateUser(req, res, next);
-};
 
 // Generate signed URL for direct upload
 router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req, res) => {
@@ -46,7 +37,7 @@ router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req,
     const bucketResult = await pool.query(`
       SELECT * FROM buckets 
       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-    `, [bucketId, req.user.userId]);
+    `, [bucketId, req.user.id]);
 
   const bucket = bucketResult.rows[0];
   if (!bucket) {
@@ -70,7 +61,7 @@ router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req,
     // Generate object key
     const timestamp = Date.now();
     const randomId = uuidv4().split('-')[0];
-    let objectKey = `users/${req.user.userId}/buckets/${bucket.slug}/${timestamp}-${randomId}-${filename}`;
+    let objectKey = `users/${req.user.id}/buckets/${bucket.slug}/${timestamp}-${randomId}-${filename}`;
     
     // Add version if versioning enabled
     if (bucket.versioning_enabled) {
@@ -94,7 +85,7 @@ router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req,
     `, [
       uploadId,
       bucketId,
-      req.user.userId,
+      req.user.id,
       filename,
       filename,
       contentType,
@@ -127,7 +118,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
     FROM upload_sessions us
     JOIN buckets b ON us.bucket_id = b.id
     WHERE us.id = $1 AND us.user_id = $2 AND us.completed_at IS NULL
-  `, [uploadId, req.user.userId]);
+  `, [uploadId, req.user.id]);
 
   const session = sessionResult.rows[0];
   if (!session) {
@@ -343,7 +334,7 @@ router.get('/uploads/:uploadId', authenticate, asyncHandler(async (req, res) => 
     FROM upload_sessions us
     LEFT JOIN files f ON us.id = f.upload_session_id
     WHERE us.id = $1 AND us.user_id = $2
-  `, [uploadId, req.user.userId]);
+  `, [uploadId, req.user.id]);
 
   const session = result.rows[0];
   if (!session) {
@@ -372,7 +363,7 @@ router.delete('/uploads/:uploadId', authenticate, asyncHandler(async (req, res) 
     DELETE FROM upload_sessions 
     WHERE id = $1 AND user_id = $2 AND completed_at IS NULL
     RETURNING id
-  `, [uploadId, req.user.userId]);
+  `, [uploadId, req.user.id]);
 
   if (!result.rows[0]) {
     throw createError('UPLOAD_SESSION_NOT_FOUND', { uploadId });

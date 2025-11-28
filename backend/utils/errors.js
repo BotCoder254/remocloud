@@ -219,7 +219,7 @@ function errorHandler(err, req, res, next) {
     if (errorConfig?.userMessage) {
       response.error.userMessage = errorConfig.userMessage.replace(
         '{maxSize}', 
-        details?.maxSize || '100MB'
+        err.details?.maxSize || '100MB'
       );
     }
 

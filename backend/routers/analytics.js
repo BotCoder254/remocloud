@@ -1,11 +1,11 @@
 const express = require('express');
-const { authenticateApiKey } = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
 const analyticsService = require('../utils/analytics');
 
 const router = express.Router();
 
 // Get analytics overview
-router.get('/analytics/overview', authenticateApiKey, async (req, res) => {
+router.get('/analytics/overview', authenticate, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const userId = req.user.id;
@@ -28,7 +28,7 @@ router.get('/analytics/overview', authenticateApiKey, async (req, res) => {
 });
 
 // Get bucket-specific analytics
-router.get('/analytics/buckets/:bucketId', authenticateApiKey, async (req, res) => {
+router.get('/analytics/buckets/:bucketId', authenticate, async (req, res) => {
   try {
     const { bucketId } = req.params;
     const { startDate, endDate } = req.query;
@@ -52,7 +52,7 @@ router.get('/analytics/buckets/:bucketId', authenticateApiKey, async (req, res) 
 });
 
 // Get storage usage by bucket
-router.get('/analytics/storage', authenticateApiKey, async (req, res) => {
+router.get('/analytics/storage', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
     const storage = await analyticsService.getStorageByBucket(userId);
@@ -64,7 +64,7 @@ router.get('/analytics/storage', authenticateApiKey, async (req, res) => {
 });
 
 // Get top files by downloads
-router.get('/analytics/top-files', authenticateApiKey, async (req, res) => {
+router.get('/analytics/top-files', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
     const { limit = 10 } = req.query;
@@ -77,7 +77,7 @@ router.get('/analytics/top-files', authenticateApiKey, async (req, res) => {
 });
 
 // Export analytics data
-router.get('/analytics/export', authenticateApiKey, async (req, res) => {
+router.get('/analytics/export', authenticate, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const userId = req.user.id;

@@ -14,7 +14,7 @@ const authenticateUser = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    req.user = { id: decoded.userId };
     next();
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
@@ -49,7 +49,7 @@ const authenticateApiKey = async (req, res, next) => {
     // Update last used timestamp
     await pool.query('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1', [validKey.id]);
 
-    req.user = { userId: validKey.user_id };
+    req.user = { id: validKey.user_id };
     req.apiKey = validKey;
     next();
   } catch (error) {
@@ -57,4 +57,27 @@ const authenticateApiKey = async (req, res, next) => {
   }
 };
 
-module.exports = { authenticateUser, authenticateApiKey };
+// Authenticate either JWT or API key
+const authenticate = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    // Check if it's an API key
+    if (token.startsWith('rk_')) {
+      return authenticateApiKey(req, res, next);
+    }
+
+    // Otherwise treat as JWT
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = { id: decoded.userId };
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+module.exports = { authenticateUser, authenticateApiKey, authenticate };
