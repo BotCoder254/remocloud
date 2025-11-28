@@ -1,0 +1,53 @@
+{
+  "name": "@remocloud/sdk",
+  "version": "1.0.0",
+  "description": "Official JavaScript/React SDK for RemoCloud - Modern cloud file storage with image transforms and analytics",
+  "main": "index.js",
+  "browser": "index.js",
+  "module": "index.esm.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.esm.js",
+    "hooks.js",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "echo \"Build complete\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cloud-storage",
+    "file-upload",
+    "image-transforms",
+    "react-hooks",
+    "sdk",
+    "remocloud",
+    "cdn",
+    "analytics"
+  ],
+  "author": "RemoCloud Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/remocloud/sdk"
+  },
+  "homepage": "https://remocloud.dev",
+  "bugs": {
+    "url": "https://github.com/remocloud/sdk/issues"
+  },
+  "peerDependencies": {
+    "react": ">=16.8.0",
+    "@tanstack/react-query": ">=4.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.13.2"
+  },
+  "devDependencies": {
+    "@tanstack/react-query": "^5.90.11",
+    "react": "^19.2.0",
+    "nodemon": "^3.1.11"
+  }
+}
