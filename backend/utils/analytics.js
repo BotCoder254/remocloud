@@ -47,7 +47,7 @@ class AnalyticsService {
 
     Object.entries(stats).forEach(([key, value]) => {
       if (value !== 0) {
-        updateFields.push(`${key} = ${key} + $${valueIndex}`);
+        updateFields.push(`${key} = usage_analytics.${key} + $${valueIndex}`);
         values.push(value);
         valueIndex++;
       }
