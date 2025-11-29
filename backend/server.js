@@ -5,7 +5,7 @@ const { errorHandler } = require('./utils/errors');
 require('dotenv').config();
 
 const { initDB } = require('./models/database');
-const { cleanupExpiredSessions } = require('./utils/cleanup');
+const cleanupService = require('./utils/cleanup');
 const authRoutes = require('./routers/auth');
 const apiKeyRoutes = require('./routers/apiKeys');
 const bucketRoutes = require('./routers/buckets');
@@ -15,6 +15,7 @@ const storageRoutes = require('./routers/storage');
 const cdnRoutes = require('./routers/cdn');
 const transformRoutes = require('./routers/transforms');
 const analyticsRoutes = require('./routers/analytics');
+const cleanupRoutes = require('./routers/cleanup');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -42,6 +43,7 @@ app.use('/api', uploadRoutes);
 app.use('/api/storage', storageRoutes);
 app.use('/api', transformRoutes);
 app.use('/api', analyticsRoutes);
+app.use('/api', cleanupRoutes);
 app.use('/cdn', cdnRoutes);
 
 // Health check
@@ -55,9 +57,13 @@ app.use(errorHandler);
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   
-  // Run cleanup every hour
-  setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
+  // Run file cleanup every 24 hours
+  setInterval(() => {
+    cleanupService.runFullCleanup().catch(console.error);
+  }, 24 * 60 * 60 * 1000);
   
-  // Run initial cleanup
-  setTimeout(cleanupExpiredSessions, 5000);
+  // Run initial cleanup after 30 seconds
+  setTimeout(() => {
+    cleanupService.runFullCleanup().catch(console.error);
+  }, 30000);
 });

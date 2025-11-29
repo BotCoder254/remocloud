@@ -10,7 +10,8 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  Book
+  Book,
+  Trash2
 } from 'lucide-react';
 import { useLocation, Link } from 'react-router-dom';
 
@@ -24,6 +25,7 @@ const Sidebar = ({ isCollapsed, onToggle }) => {
     { icon: Upload, label: 'Uploads', path: '/uploads' },
     { icon: Key, label: 'API Keys', path: '/api-keys' },
     { icon: BarChart3, label: 'Analytics', path: '/analytics' },
+    { icon: Trash2, label: 'Trash', path: '/trash' },
     { icon: Settings, label: 'Settings', path: '/settings' },
   ];
 

@@ -196,11 +196,7 @@ const Files = () => {
       queryClient.invalidateQueries(['files', selectedBucket]);
       queryClient.invalidateQueries(['buckets']);
       
-      if (response.data.retentionDays) {
-        toast.success(`File moved to trash. Recoverable for ${response.data.retentionDays} days.`);
-      } else {
-        toast.success('File deleted successfully');
-      }
+      toast.success('File moved to trash. Can be restored within 7 days.');
       
       setShowDeleteConfirm(false);
       setFileToDelete(null);

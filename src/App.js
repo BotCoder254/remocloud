@@ -18,6 +18,7 @@ import Files from './pages/Files';
 import Uploads from './pages/Uploads';
 import Analytics from './pages/Analytics';
 import Documentation from './pages/Documentation';
+import Trash from './pages/Trash';
 
 // Create a client with enhanced error handling
 const queryClient = new QueryClient({
@@ -162,6 +163,16 @@ function App() {
                 <ProtectedRoute>
                   <Layout>
                     <Analytics />
+                  </Layout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/trash"
+              element={
+                <ProtectedRoute>
+                  <Layout>
+                    <Trash />
                   </Layout>
                 </ProtectedRoute>
               }

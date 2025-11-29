@@ -7,6 +7,77 @@ const analyticsService = require('../utils/analytics');
 
 const router = express.Router();
 
+// Get trash files (must be before /:fileId route)
+router.get('/trash', authenticate, async (req, res) => {
+  try {
+    const { cursor, limit = 20, sortBy = 'deleted_at', sortOrder = 'DESC' } = req.query;
+
+    let query = `
+      SELECT f.id, f.original_name, f.size, f.mime_type, f.deleted_at, f.created_at,
+             COALESCE(b.name, 'Unknown') as bucket_name
+      FROM files f
+      LEFT JOIN buckets b ON f.bucket_id = b.id
+      WHERE f.user_id = $1 AND f.deleted_at IS NOT NULL
+    `;
+    
+    let params = [req.user.id];
+    let paramCount = 1;
+
+    if (cursor) {
+      paramCount++;
+      const cursorCondition = sortOrder === 'DESC' ? '<' : '>';
+      query += ` AND f.${sortBy} ${cursorCondition} $${paramCount}`;
+      params.push(cursor);
+    }
+
+    const allowedSortFields = ['deleted_at', 'original_name', 'size'];
+    const sortField = allowedSortFields.includes(sortBy) ? sortBy : 'deleted_at';
+    const order = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    
+    query += ` ORDER BY f.${sortField} ${order}`;
+    
+    paramCount++;
+    query += ` LIMIT $${paramCount}`;
+    params.push(parseInt(limit) + 1);
+
+    const result = await pool.query(query, params);
+    const files = result.rows.map(file => {
+      const deletedAt = new Date(file.deleted_at);
+      const restoreUntil = new Date(deletedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const expired = restoreUntil < new Date();
+      
+      return {
+        ...file,
+        restore_until: restoreUntil.toISOString(),
+        expired
+      };
+    });
+
+    const hasMore = files.length > parseInt(limit);
+    if (hasMore) {
+      files.pop();
+    }
+
+    let nextCursor = null;
+    if (hasMore && files.length > 0) {
+      const lastFile = files[files.length - 1];
+      nextCursor = lastFile[sortField];
+    }
+
+    res.json({
+      files,
+      pagination: {
+        hasMore,
+        nextCursor,
+        limit: parseInt(limit)
+      }
+    });
+  } catch (error) {
+    console.error('Trash fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch trash files' });
+  }
+});
+
 // Get files with pagination, filtering, and search
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -592,7 +663,7 @@ router.get('/:fileId/download', async (req, res) => {
   }
 });
 
-// Delete file and cleanup Large Objects
+// Move file to trash (soft delete with 7-day restore period)
 router.delete('/:fileId', authenticate, async (req, res) => {
   const client = await pool.connect();
   
@@ -600,10 +671,11 @@ router.delete('/:fileId', authenticate, async (req, res) => {
     await client.query('BEGIN');
     
     const { fileId } = req.params;
+    const { permanent = false } = req.query;
     
     // Get file info
     const fileResult = await client.query(
-      'SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      'SELECT * FROM files WHERE id = $1 AND user_id = $2',
       [fileId, req.user.id]
     );
 
@@ -613,50 +685,58 @@ router.delete('/:fileId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Delete derivatives from file_data table
-    const derivativesResult = await client.query(
-      'SELECT file_hash FROM image_derivatives WHERE file_id = $1',
-      [fileId]
-    );
+    if (permanent || file.deleted_at) {
+      // Permanent delete - cleanup file data
+      const derivativesResult = await client.query(
+        'SELECT file_hash FROM image_derivatives WHERE file_id = $1',
+        [fileId]
+      );
 
-    const { deleteFileData } = require('../utils/fileStorage');
-    for (const derivative of derivativesResult.rows) {
-      if (derivative.file_hash) {
-        await deleteFileData(client, derivative.file_hash);
+      const { deleteFileData } = require('../utils/fileStorage');
+      for (const derivative of derivativesResult.rows) {
+        if (derivative.file_hash) {
+          await deleteFileData(client, derivative.file_hash);
+        }
       }
-    }
 
-    // Delete file from file_data table
-    if (file.file_hash) {
-      await deleteFileData(client, file.file_hash);
-    }
-
-    // Delete file versions from file_data table
-    const versionsResult = await client.query(
-      'SELECT file_hash FROM file_versions WHERE file_id = $1',
-      [fileId]
-    );
-    
-    for (const version of versionsResult.rows) {
-      if (version.file_hash) {
-        await deleteFileData(client, version.file_hash);
+      if (file.file_hash) {
+        await deleteFileData(client, file.file_hash);
       }
+
+      const versionsResult = await client.query(
+        'SELECT file_hash FROM file_versions WHERE file_id = $1',
+        [fileId]
+      );
+      
+      for (const version of versionsResult.rows) {
+        if (version.file_hash) {
+          await deleteFileData(client, version.file_hash);
+        }
+      }
+
+      // Delete from database
+      await client.query('DELETE FROM files WHERE id = $1', [fileId]);
+      
+      res.json({ message: 'File permanently deleted' });
+    } else {
+      // Soft delete - move to trash with 7-day restore period
+      await client.query(
+        'UPDATE files SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1',
+        [fileId]
+      );
+
+      // Update bucket stats
+      await client.query(
+        'UPDATE buckets SET file_count = file_count - 1, storage_used = storage_used - $1 WHERE id = $2',
+        [file.size, file.bucket_id]
+      );
+
+      res.json({ 
+        message: 'File moved to trash. Can be restored within 7 days.'
+      });
     }
-
-    // Mark file as deleted
-    await client.query(
-      'UPDATE files SET deleted_at = CURRENT_TIMESTAMP, deleted_by = $1 WHERE id = $2',
-      [req.user.id, fileId]
-    );
-
-    // Update bucket stats
-    await client.query(
-      'UPDATE buckets SET file_count = file_count - 1, storage_used = storage_used - $1 WHERE id = $2',
-      [file.size, file.bucket_id]
-    );
 
     await client.query('COMMIT');
-    res.json({ message: 'File deleted successfully' });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Delete error:', error);
@@ -696,32 +776,50 @@ router.get('/:fileId/public-url', async (req, res) => {
   }
 });
 
+
+
 // Restore deleted file
 router.post('/:fileId/restore', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  
   try {
+    await client.query('BEGIN');
+    
     const { fileId } = req.params;
     
-    const result = await pool.query(`
+    const result = await client.query(`
       UPDATE files 
-      SET deleted_at = NULL, 
-          deleted_by = NULL,
-          restore_until = NULL,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL AND restore_until > CURRENT_TIMESTAMP
+      SET deleted_at = NULL
+      WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL 
+        AND deleted_at > (CURRENT_TIMESTAMP - INTERVAL '7 days')
       RETURNING *
     `, [fileId, req.user.id]);
 
     if (!result.rows[0]) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'File not found or restore period expired' });
     }
 
+    const file = result.rows[0];
+    
+    // Update bucket stats
+    await client.query(
+      'UPDATE buckets SET file_count = file_count + 1, storage_used = storage_used + $1 WHERE id = $2',
+      [file.size, file.bucket_id]
+    );
+
+    await client.query('COMMIT');
+    
     res.json({ 
       message: 'File restored successfully',
-      file: result.rows[0]
+      file
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Restore error:', error);
     res.status(500).json({ error: 'Failed to restore file' });
+  } finally {
+    client.release();
   }
 });
 
