@@ -76,11 +76,18 @@ const initDB = async () => {
         signed_url TEXT NOT NULL,
         expires_at TIMESTAMP NOT NULL,
         completed_at TIMESTAMP,
+        metadata_json JSONB DEFAULT '{}',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    
+    // Add metadata_json column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE upload_sessions 
+      ADD COLUMN IF NOT EXISTS metadata_json JSONB DEFAULT '{}'
+    `).catch(() => {}); // Ignore if column already exists
 
-    // Files table
+    // Files table with Large Objects support
     await pool.query(`
       CREATE TABLE IF NOT EXISTS files (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -93,6 +100,7 @@ const initDB = async () => {
         size BIGINT,
         object_key TEXT NOT NULL,
         file_hash VARCHAR(255),
+        lo_oid OID,
         is_public BOOLEAN DEFAULT FALSE,
         version INTEGER DEFAULT 1,
         current_version_id UUID,
@@ -106,7 +114,7 @@ const initDB = async () => {
       )
     `);
 
-    // File versions table for version history
+    // File versions table with Large Objects support
     await pool.query(`
       CREATE TABLE IF NOT EXISTS file_versions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -118,6 +126,7 @@ const initDB = async () => {
         size BIGINT,
         object_key TEXT NOT NULL,
         file_hash VARCHAR(255),
+        lo_oid OID,
         metadata_json JSONB DEFAULT '{}',
         is_current BOOLEAN DEFAULT FALSE,
         created_by UUID REFERENCES users(id),
@@ -136,7 +145,7 @@ const initDB = async () => {
       ON DELETE SET NULL
     `).catch(() => {}); // Ignore if constraint already exists
 
-    // Image derivatives table for transform caching
+    // Image derivatives table with file hash support
     await pool.query(`
       CREATE TABLE IF NOT EXISTS image_derivatives (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -145,6 +154,7 @@ const initDB = async () => {
         transform_spec JSONB NOT NULL,
         transform_key VARCHAR(255) NOT NULL,
         object_key TEXT NOT NULL,
+        file_hash VARCHAR(255),
         mime_type VARCHAR(255) NOT NULL,
         size BIGINT NOT NULL,
         width INTEGER,
@@ -156,6 +166,12 @@ const initDB = async () => {
         UNIQUE(file_version_id, transform_key)
       )
     `);
+    
+    // Add file_hash column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE image_derivatives 
+      ADD COLUMN IF NOT EXISTS file_hash VARCHAR(255)
+    `).catch(() => {});
 
     // Usage analytics table for tracking daily aggregates
     await pool.query(`
@@ -172,6 +188,16 @@ const initDB = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, bucket_id, date)
+      )
+    `);
+
+    // File data table for storing actual file contents
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS file_data (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        file_hash VARCHAR(255) UNIQUE NOT NULL,
+        data BYTEA NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -200,4 +226,89 @@ const initDB = async () => {
   }
 };
 
-module.exports = { pool, initDB };
+// Large Objects utility functions
+const createLargeObject = async (client, buffer) => {
+  const oid = await client.query('SELECT lo_create(0) as oid');
+  const loOid = oid.rows[0].oid;
+  console.log('Created LO with OID:', loOid, 'Type:', typeof loOid);
+  
+  if (!loOid || loOid === 0) {
+    throw new Error('Failed to create Large Object');
+  }
+  
+  const fd = await client.query('SELECT lo_open($1, $2) as fd', [loOid, 0x20000]); // INV_WRITE
+  const descriptor = fd.rows[0].fd;
+  
+  // Write buffer in chunks
+  const chunkSize = 8192;
+  for (let i = 0; i < buffer.length; i += chunkSize) {
+    const chunk = buffer.slice(i, i + chunkSize);
+    await client.query('SELECT lowrite($1, $2)', [descriptor, chunk]);
+  }
+  
+  await client.query('SELECT lo_close($1)', [descriptor]);
+  console.log('Successfully wrote', buffer.length, 'bytes to LO OID:', loOid);
+  return loOid;
+};
+
+const readLargeObject = async (client, oid) => {
+  if (!oid || oid === 0) {
+    throw new Error('Invalid Large Object OID');
+  }
+  
+  try {
+    // Use lo_export to export the Large Object to bytea
+    const result = await client.query('SELECT lo_export($1, $2) as success', [oid, `/tmp/lo_${oid}`]);
+    
+    // Read the exported file
+    const fs = require('fs');
+    const filePath = `/tmp/lo_${oid}`;
+    
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Large Object ${oid} export failed`);
+    }
+    
+    const buffer = fs.readFileSync(filePath);
+    
+    // Clean up the temporary file
+    fs.unlinkSync(filePath);
+    
+    return buffer;
+  } catch (error) {
+    // Fallback: try reading with lo_open/loread
+    console.log('Export failed, trying lo_open method:', error.message);
+    
+    const fd = await client.query('SELECT lo_open($1, $2) as fd', [oid, 0x40000]); // INV_READ
+    const descriptor = fd.rows[0].fd;
+    
+    if (descriptor < 0) {
+      throw new Error(`Failed to open Large Object ${oid}, descriptor: ${descriptor}`);
+    }
+    
+    const chunks = [];
+    let chunk;
+    
+    do {
+      const result = await client.query('SELECT loread($1, $2) as data', [descriptor, 8192]);
+      chunk = result.rows[0].data;
+      if (chunk && chunk.length > 0) {
+        chunks.push(chunk);
+      }
+    } while (chunk && chunk.length > 0);
+    
+    await client.query('SELECT lo_close($1)', [descriptor]);
+    return Buffer.concat(chunks);
+  }
+};
+
+const deleteLargeObject = async (client, oid) => {
+  if (oid && oid !== 0) {
+    // Check if Large Object exists before deleting
+    const exists = await client.query('SELECT 1 FROM pg_largeobject_metadata WHERE oid = $1', [oid]);
+    if (exists.rows.length > 0) {
+      await client.query('SELECT lo_unlink($1)', [oid]);
+    }
+  }
+};
+
+module.exports = { pool, initDB, createLargeObject, readLargeObject, deleteLargeObject };

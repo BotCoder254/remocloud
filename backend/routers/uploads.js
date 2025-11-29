@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const { pool } = require('../models/database');
 const { authenticate } = require('../middleware/auth');
 const FileValidationService = require('../utils/fileValidation');
+const { validateFileSize } = require('../utils/fileLimits');
 const analyticsService = require('../utils/analytics');
 const { createError, asyncHandler } = require('../utils/errors');
 
@@ -25,29 +26,31 @@ router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req,
     }, 'Missing required fields');
   }
 
-  // Validate file size (100MB limit for MVP)
-  if (size > 100 * 1024 * 1024) {
+  // Validate file size based on media type
+  const sizeValidation = validateFileSize(contentType, size);
+  if (!sizeValidation.isValid) {
     throw createError('FILE_TOO_LARGE', {
-      maxSize: 100 * 1024 * 1024,
-      receivedSize: size
-    });
+      maxSize: sizeValidation.limit,
+      receivedSize: size,
+      mimeType: contentType
+    }, `File too large. Maximum size for ${contentType} is ${Math.round(sizeValidation.limit / 1024 / 1024)}MB`);
   }
 
-    // Get bucket and validate permissions
-    const bucketResult = await pool.query(`
-      SELECT * FROM buckets 
-      WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-    `, [bucketId, req.user.id]);
+  // Get bucket and validate permissions
+  const bucketResult = await pool.query(`
+    SELECT * FROM buckets 
+    WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+  `, [bucketId, req.user.id]);
 
   const bucket = bucketResult.rows[0];
   if (!bucket) {
     throw createError('BUCKET_NOT_FOUND', { bucketId });
   }
 
-    // Validate file type against bucket policy
-    const allowedTypes = bucket.allowed_types || ['*'];
-    const typeValidation = FileValidationService.validateFileType(filename, contentType, allowedTypes);
-    
+  // Validate file type against bucket policy
+  const allowedTypes = bucket.allowed_types || ['*'];
+  const typeValidation = FileValidationService.validateFileType(filename, contentType, allowedTypes);
+  
   if (!typeValidation.isValid) {
     const errorInfo = FileValidationService.formatValidationError(typeValidation, allowedTypes);
     throw createError('INVALID_FILE_TYPE', {
@@ -58,42 +61,40 @@ router.post('/buckets/:bucketId/uploads', authenticate, asyncHandler(async (req,
     }, errorInfo.message);
   }
 
-    // Generate object key
-    const timestamp = Date.now();
-    const randomId = uuidv4().split('-')[0];
-    let objectKey = `users/${req.user.id}/buckets/${bucket.slug}/${timestamp}-${randomId}-${filename}`;
-    
-    // Add version if versioning enabled
-    if (bucket.versioning_enabled) {
-      const versionId = uuidv4().split('-')[0];
-      objectKey += `?versionId=${versionId}`;
-    }
+  // Generate object key
+  const timestamp = Date.now();
+  const randomId = uuidv4().split('-')[0];
+  let objectKey = `users/${req.user.id}/buckets/${bucket.slug}/${timestamp}-${randomId}-${filename}`;
+  
+  // Add version if versioning enabled
+  if (bucket.versioning_enabled) {
+    const versionId = uuidv4().split('-')[0];
+    objectKey += `?versionId=${versionId}`;
+  }
 
-    // Generate upload session ID
-    const uploadId = uuidv4();
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-    
-    // For MVP, we'll create a mock signed URL that points to our server
-    // In production, this would be a real signed URL from AWS S3, Google Cloud Storage, etc.
-    const signedUrl = `${process.env.API_BASE_URL || 'http://localhost:5000'}/api/storage/upload/${uploadId}`;
+  // Generate upload session ID
+  const uploadId = uuidv4();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+  
+  const signedUrl = `${process.env.API_BASE_URL || 'http://localhost:5000'}/api/storage/upload/${uploadId}`;
 
-    // Store upload session
-    await pool.query(`
-      INSERT INTO upload_sessions 
-      (id, bucket_id, user_id, filename, original_name, mime_type, size, object_key, signed_url, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    `, [
-      uploadId,
-      bucketId,
-      req.user.id,
-      filename,
-      filename,
-      contentType,
-      size,
-      objectKey,
-      signedUrl,
-      expiresAt
-    ]);
+  // Store upload session
+  await pool.query(`
+    INSERT INTO upload_sessions 
+    (id, bucket_id, user_id, filename, original_name, mime_type, size, object_key, signed_url, expires_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+  `, [
+    uploadId,
+    bucketId,
+    req.user.id,
+    filename,
+    filename,
+    contentType,
+    size,
+    objectKey,
+    signedUrl,
+    expiresAt
+  ]);
 
   res.json({
     uploadId,
@@ -130,34 +131,47 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
     throw createError('SIGNED_URL_EXPIRED', { uploadId, expiresAt: session.expires_at });
   }
 
-  // Verify file exists on disk
-  const filePath = require('path').join(__dirname, '../uploads', uploadId);
-  if (!require('fs').existsSync(filePath)) {
+  // Debug: Check what's in session metadata
+  console.log('Session metadata:', JSON.stringify(session.metadata_json, null, 2));
+  
+  // Get file data directly from upload session metadata
+  const fileData = session.metadata_json?.file_data;
+  
+  if (!fileData) {
     throw createError('UPLOAD_FAILED', {
       uploadId,
-      reason: 'File not found on server'
-    }, 'Upload failed - file not received');
+      reason: 'File data not found in session',
+      metadata: session.metadata_json
+    }, 'Upload failed - file data not received');
   }
-
-    // Get actual file size and validate
-    const fileStats = require('fs').statSync(filePath);
-    const actualFileSize = fileStats.size;
+  
+  const fileBuffer = Buffer.from(fileData, 'base64');
+  
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
     
-  if (actualSize && actualSize !== actualFileSize) {
-    throw createError('UPLOAD_FAILED', {
-      expectedSize: actualSize,
-      actualSize: actualFileSize,
-      uploadId
-    }, 'File size mismatch');
-  }
+    const actualFileSize = fileBuffer.length;
+    
+    if (actualSize && actualSize !== actualFileSize) {
+      throw createError('UPLOAD_FAILED', {
+        expectedSize: actualSize,
+        actualSize: actualFileSize,
+        uploadId
+      }, 'File size mismatch');
+    }
 
     // Generate file hash from actual file content
-    const fileBuffer = require('fs').readFileSync(filePath);
     const fileHash = crypto
       .createHash('sha256')
       .update(fileBuffer)
       .digest('hex');
-    
+      
+    // Store file data in database
+    const { storeFileData } = require('../utils/fileStorage');
+    await storeFileData(client, fileBuffer, fileHash);
+      
     // Verify client hash if provided
     let hashVerification = null;
     if (clientHash) {
@@ -177,7 +191,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
     let existingFileId = null;
     
     if (session.versioning_enabled) {
-      const existingResult = await pool.query(`
+      const existingResult = await client.query(`
         SELECT id, version FROM files 
         WHERE bucket_id = $1 AND original_name = $2 AND deleted_at IS NULL
         ORDER BY version DESC LIMIT 1
@@ -189,37 +203,11 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
       }
     }
 
-    // Validate uploaded file signature
-    const fileValidation = FileValidationService.validateUploadedFile(
-      filePath, 
-      session.original_name, 
-      session.mime_type, 
-      session.versioning_enabled ? ['*'] : (await pool.query('SELECT allowed_types FROM buckets WHERE id = $1', [session.bucket_id])).rows[0]?.allowed_types || ['*']
-    );
-    
-    if (!fileValidation.isValid) {
-      // Delete the invalid file
-      require('fs').unlinkSync(filePath);
-      
-      const errorInfo = FileValidationService.formatValidationError(fileValidation, session.allowed_types || ['*']);
-      return res.status(400).json({
-        error: errorInfo.message,
-        allowedTypes: errorInfo.allowedTypes,
-        suggestion: errorInfo.suggestion,
-        validationErrors: fileValidation.errors,
-        fileInfo: fileValidation.fileInfo
-      });
-    }
-
-    // Move file to final location with proper filename
-    const finalPath = require('path').join(__dirname, '../uploads', `${fileHash}-${session.original_name}`);
-    require('fs').renameSync(filePath, finalPath);
-
     let fileResult;
     
     if (existingFileId && version > 1) {
       // Update existing file for new version
-      fileResult = await pool.query(`
+      fileResult = await client.query(`
         UPDATE files 
         SET filename = $1, mime_type = $2, size = $3, object_key = $4, file_hash = $5, 
             version = $6, updated_at = CURRENT_TIMESTAMP
@@ -236,7 +224,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
       ]);
       
       // Create version history record
-      await pool.query(`
+      await client.query(`
         INSERT INTO file_versions 
         (file_id, version_number, filename, original_name, mime_type, size, object_key, file_hash, metadata_json, created_by, is_current)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
@@ -254,7 +242,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
       ]);
       
       // Mark previous versions as not current
-      await pool.query(`
+      await client.query(`
         UPDATE file_versions 
         SET is_current = false 
         WHERE file_id = $1 AND version_number < $2
@@ -262,7 +250,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
       
     } else {
       // Create new file record
-      fileResult = await pool.query(`
+      fileResult = await client.query(`
         INSERT INTO files 
         (bucket_id, user_id, upload_session_id, filename, original_name, mime_type, size, object_key, file_hash, is_public, version, created_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -283,7 +271,7 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
       ]);
       
       // Create initial version record
-      await pool.query(`
+      await client.query(`
         INSERT INTO file_versions 
         (file_id, version_number, filename, original_name, mime_type, size, object_key, file_hash, metadata_json, created_by, is_current)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
@@ -302,14 +290,14 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
     }
 
     // Mark upload session as completed
-    await pool.query(`
+    await client.query(`
       UPDATE upload_sessions 
       SET completed_at = CURRENT_TIMESTAMP 
       WHERE id = $1
     `, [uploadId]);
 
     // Update bucket stats
-    await pool.query(`
+    await client.query(`
       UPDATE buckets 
       SET file_count = file_count + 1, storage_used = storage_used + $1
       WHERE id = $2
@@ -318,11 +306,19 @@ router.post('/uploads/:uploadId/complete', authenticate, asyncHandler(async (req
     // Track analytics
     await analyticsService.trackUpload(session.user_id, session.bucket_id, actualFileSize);
 
-  res.json({
-    file: fileResult.rows[0],
-    hashVerification,
-    message: 'Upload completed successfully'
-  });
+    await client.query('COMMIT');
+    
+    res.json({
+      file: fileResult.rows[0],
+      hashVerification,
+      message: 'Upload completed successfully'
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }));
 
 // Get upload progress/status
@@ -341,8 +337,8 @@ router.get('/uploads/:uploadId', authenticate, asyncHandler(async (req, res) => 
     throw createError('UPLOAD_SESSION_NOT_FOUND', { uploadId });
   }
 
-    const status = session.completed_at ? 'completed' : 
-                  new Date() > new Date(session.expires_at) ? 'expired' : 'pending';
+  const status = session.completed_at ? 'completed' : 
+                new Date() > new Date(session.expires_at) ? 'expired' : 'pending';
 
   res.json({
     uploadId: session.id,

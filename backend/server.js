@@ -5,6 +5,7 @@ const { errorHandler } = require('./utils/errors');
 require('dotenv').config();
 
 const { initDB } = require('./models/database');
+const { cleanupExpiredSessions } = require('./utils/cleanup');
 const authRoutes = require('./routers/auth');
 const apiKeyRoutes = require('./routers/apiKeys');
 const bucketRoutes = require('./routers/buckets');
@@ -53,4 +54,10 @@ app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  
+  // Run cleanup every hour
+  setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
+  
+  // Run initial cleanup
+  setTimeout(cleanupExpiredSessions, 5000);
 });

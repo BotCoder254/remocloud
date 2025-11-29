@@ -1,10 +1,8 @@
 const express = require('express');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const { pool } = require('../models/database');
+const { pool, readLargeObject, createLargeObject } = require('../models/database');
 const { authenticate } = require('../middleware/auth');
+const { validateFileSize } = require('../utils/fileLimits');
 const analyticsService = require('../utils/analytics');
 
 const router = express.Router();
@@ -322,51 +320,86 @@ router.put('/:fileId', authenticate, async (req, res) => {
   }
 });
 
-// Upload file (legacy endpoint - kept for compatibility)
-router.post('/upload', authenticate, multer().single('file'), async (req, res) => {
+// Upload file (legacy endpoint - kept for compatibility) using Large Objects
+router.post('/upload', authenticate, express.raw({ type: '*/*', limit: '100mb' }), async (req, res) => {
+  const client = await pool.connect();
+  
   try {
-    if (!req.file) {
+    if (!req.body || req.body.length === 0) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const { bucket_id } = req.body;
+    // For legacy endpoint, expect bucket_id in query params
+    const { bucket_id } = req.query;
     
     if (!bucket_id) {
       return res.status(400).json({ error: 'Bucket ID required' });
     }
 
+    await client.query('BEGIN');
+
     // Get bucket settings
-    const bucketResult = await pool.query(
+    const bucketResult = await client.query(
       'SELECT is_public_by_default FROM buckets WHERE id = $1 AND user_id = $2',
       [bucket_id, req.user.id]
     );
 
     if (!bucketResult.rows[0]) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Bucket not found' });
     }
 
     const isPublic = bucketResult.rows[0].is_public_by_default;
 
-    const result = await pool.query(`
+    // Store file as Large Object
+    const loOid = await createLargeObject(client, req.body);
+    
+    // Generate file hash
+    const crypto = require('crypto');
+    const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
+    
+    // Get filename from headers or use default
+    const originalName = req.headers['x-filename'] || 'uploaded-file';
+    const mimeType = req.headers['content-type'] || 'application/octet-stream';
+    
+    // Validate file size based on media type
+    const sizeValidation = validateFileSize(mimeType, req.body.length);
+    if (!sizeValidation.isValid) {
+      await client.query('ROLLBACK');
+      return res.status(413).json({ 
+        error: `File too large. Maximum size for ${mimeType} is ${Math.round(sizeValidation.limit / 1024 / 1024)}MB`,
+        maxSize: sizeValidation.limit,
+        receivedSize: req.body.length
+      });
+    }
+    
+    const result = await client.query(`
       INSERT INTO files 
-      (bucket_id, user_id, filename, original_name, mime_type, size, object_key, is_public, created_by) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+      (bucket_id, user_id, filename, original_name, mime_type, size, object_key, file_hash, lo_oid, is_public, created_by) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
       RETURNING *
     `, [
       bucket_id,
       req.user.id,
-      req.file.filename,
-      req.file.originalname,
-      req.file.mimetype,
-      req.file.size,
-      req.file.path,
+      `${fileHash}-${originalName}`,
+      originalName,
+      mimeType,
+      req.body.length,
+      `users/${req.user.id}/buckets/${bucket_id}/${Date.now()}-${originalName}`,
+      fileHash,
+      loOid,
       isPublic,
       req.user.id
     ]);
 
+    await client.query('COMMIT');
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Upload error:', error);
     res.status(500).json({ error: 'Failed to upload file' });
+  } finally {
+    client.release();
   }
 });
 
@@ -431,8 +464,10 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
   }
 });
 
-// Simple preview endpoint for images
+// Simple preview endpoint for images using Large Objects
 router.get('/:fileId/preview', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { fileId } = req.params;
     
@@ -448,34 +483,34 @@ router.get('/:fileId/preview', async (req, res) => {
     const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
     const decoded = jwt.verify(token, JWT_SECRET);
     
-    const result = await pool.query(
-      'SELECT * FROM files WHERE id = $1 AND user_id = $2',
+    const result = await client.query(
+      'SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [fileId, decoded.userId]
     );
 
     const file = result.rows[0];
-    if (!file) {
+    if (!file || !file.lo_oid) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const filePath = path.join(__dirname, '../uploads', file.filename);
-    
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
+    // Read file from Large Object
+    const { readLargeObject } = require('../models/database');
+    const fileBuffer = await readLargeObject(client, file.lo_oid);
 
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Content-Type', file.mime_type);
     res.setHeader('Content-Disposition', `inline; filename="${file.original_name}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
     res.setHeader('Cache-Control', 'private, max-age=300');
     
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
+    res.send(fileBuffer);
   } catch (error) {
     console.error('Preview error:', error);
     res.status(500).json({ error: 'Failed to serve preview' });
+  } finally {
+    client.release();
   }
 });
 
@@ -503,8 +538,10 @@ router.get('/debug/list', async (req, res) => {
   }
 });
 
-// Direct download endpoint
+// Direct download endpoint using Large Objects
 router.get('/:fileId/download', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { fileId } = req.params;
     
@@ -520,24 +557,19 @@ router.get('/:fileId/download', async (req, res) => {
     const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
     const decoded = jwt.verify(token, JWT_SECRET);
     
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [fileId, decoded.userId]
     );
 
     const file = result.rows[0];
-    if (!file) {
+    if (!file || !file.lo_oid) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const filePath = path.join(__dirname, '../uploads', file.filename);
-    console.log(`Looking for file at: ${filePath}`);
-    
-    if (!fs.existsSync(filePath)) {
-      console.log(`File not found on disk: ${filePath}`);
-      console.log(`File record:`, { id: file.id, filename: file.filename, original_name: file.original_name });
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
+    // Read file from Large Object
+    const { readLargeObject } = require('../models/database');
+    const fileBuffer = await readLargeObject(client, file.lo_oid);
 
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
@@ -545,13 +577,89 @@ router.get('/:fileId/download', async (req, res) => {
     res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
     res.setHeader('Content-Disposition', `attachment; filename="${file.original_name}"`);
     res.setHeader('Content-Type', file.mime_type);
-    res.setHeader('Content-Length', file.size);
+    res.setHeader('Content-Length', fileBuffer.length);
     
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
+    res.send(fileBuffer);
   } catch (error) {
     console.error('Download error:', error);
     res.status(500).json({ error: 'Failed to download file' });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete file and cleanup Large Objects
+router.delete('/:fileId', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { fileId } = req.params;
+    
+    // Get file info
+    const fileResult = await client.query(
+      'SELECT * FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      [fileId, req.user.id]
+    );
+
+    const file = fileResult.rows[0];
+    if (!file) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Get all derivatives for cleanup
+    const derivativesResult = await client.query(
+      'SELECT lo_oid FROM image_derivatives WHERE file_id = $1',
+      [fileId]
+    );
+
+    // Delete derivatives Large Objects
+    const { deleteLargeObject } = require('../models/database');
+    for (const derivative of derivativesResult.rows) {
+      if (derivative.lo_oid) {
+        await deleteLargeObject(client, derivative.lo_oid);
+      }
+    }
+
+    // Delete file Large Object
+    if (file.lo_oid) {
+      await deleteLargeObject(client, file.lo_oid);
+    }
+
+    // Delete file versions Large Objects
+    const versionsResult = await client.query(
+      'SELECT lo_oid FROM file_versions WHERE file_id = $1',
+      [fileId]
+    );
+    
+    for (const version of versionsResult.rows) {
+      if (version.lo_oid) {
+        await deleteLargeObject(client, version.lo_oid);
+      }
+    }
+
+    // Mark file as deleted
+    await client.query(
+      'UPDATE files SET deleted_at = CURRENT_TIMESTAMP, deleted_by = $1 WHERE id = $2',
+      [req.user.id, fileId]
+    );
+
+    // Update bucket stats
+    await client.query(
+      'UPDATE buckets SET file_count = file_count - 1, storage_used = storage_used - $1 WHERE id = $2',
+      [file.size, file.bucket_id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'File deleted successfully' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Delete error:', error);
+    res.status(500).json({ error: 'Failed to delete file' });
+  } finally {
+    client.release();
   }
 });
 
@@ -561,7 +669,7 @@ router.get('/:fileId/public-url', async (req, res) => {
     const { fileId } = req.params;
     
     const result = await pool.query(
-      'SELECT f.*, b.is_public_by_default FROM files f JOIN buckets b ON f.bucket_id = b.id WHERE f.id = $1 AND f.is_public = true',
+      'SELECT f.*, b.is_public_by_default FROM files f JOIN buckets b ON f.bucket_id = b.id WHERE f.id = $1 AND f.is_public = true AND f.deleted_at IS NULL',
       [fileId]
     );
 
@@ -582,70 +690,6 @@ router.get('/:fileId/public-url', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to get public URL' });
-  }
-});
-
-// Soft delete file
-router.delete('/:fileId', authenticate, async (req, res) => {
-  try {
-    const { fileId } = req.params;
-    const { permanent = false } = req.query;
-    
-    if (permanent === 'true') {
-      // Permanent delete (admin only or after retention period)
-      const result = await pool.query(
-        'DELETE FROM files WHERE id = $1 AND user_id = $2 RETURNING filename, size, bucket_id',
-        [fileId, req.user.id]
-      );
-
-      const file = result.rows[0];
-      if (!file) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-
-      // Delete file from disk
-      const filePath = path.join(__dirname, '../uploads', file.filename);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
-      // Update bucket stats
-      await pool.query(`
-        UPDATE buckets 
-        SET file_count = file_count - 1, storage_used = storage_used - $1
-        WHERE id = $2
-      `, [file.size, file.bucket_id]);
-
-      // Track delete analytics
-      await analyticsService.trackDelete(req.user.id, file.bucket_id, file.size);
-
-      res.json({ message: 'File permanently deleted' });
-    } else {
-      // Soft delete with 7-day retention
-      const restoreUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-      
-      const result = await pool.query(`
-        UPDATE files 
-        SET deleted_at = CURRENT_TIMESTAMP, 
-            deleted_by = $1,
-            restore_until = $2
-        WHERE id = $3 AND user_id = $1 AND deleted_at IS NULL
-        RETURNING *
-      `, [req.user.id, restoreUntil, fileId]);
-
-      if (!result.rows[0]) {
-        return res.status(404).json({ error: 'File not found or already deleted' });
-      }
-
-      res.json({ 
-        message: 'File moved to trash',
-        restoreUntil: restoreUntil.toISOString(),
-        retentionDays: 7
-      });
-    }
-  } catch (error) {
-    console.error('Delete error:', error);
-    res.status(500).json({ error: 'Failed to delete file' });
   }
 });
 
@@ -837,29 +881,26 @@ router.get('/:fileId/hash', authenticate, async (req, res) => {
   }
 });
 
-// Verify file integrity
+// Verify file integrity using Large Objects
 router.post('/:fileId/verify', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { fileId } = req.params;
     const { clientHash } = req.body;
     
-    const result = await pool.query(
-      'SELECT file_hash, filename, original_name FROM files WHERE id = $1 AND user_id = $2',
+    const result = await client.query(
+      'SELECT file_hash, lo_oid, original_name FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [fileId, req.user.id]
     );
 
     const file = result.rows[0];
-    if (!file) {
+    if (!file || !file.lo_oid) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Re-compute server-side hash
-    const filePath = path.join(__dirname, '../uploads', file.filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
-
-    const fileBuffer = fs.readFileSync(filePath);
+    // Re-compute server-side hash from Large Object
+    const fileBuffer = await readLargeObject(client, file.lo_oid);
     const computedHash = require('crypto')
       .createHash('sha256')
       .update(fileBuffer)
@@ -884,6 +925,8 @@ router.post('/:fileId/verify', authenticate, async (req, res) => {
   } catch (error) {
     console.error('Verify integrity error:', error);
     res.status(500).json({ error: 'Failed to verify file integrity' });
+  } finally {
+    client.release();
   }
 });
 

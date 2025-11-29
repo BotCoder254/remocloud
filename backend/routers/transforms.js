@@ -1,9 +1,7 @@
 const express = require('express');
-const { pool } = require('../models/database');
+const { pool, readLargeObject, createLargeObject } = require('../models/database');
 const { authenticate } = require('../middleware/auth');
 const imageTransform = require('../utils/imageTransform');
-const fs = require('fs').promises;
-const path = require('path');
 const crypto = require('crypto');
 
 const router = express.Router();
@@ -169,39 +167,44 @@ router.get('/files/:fileId/srcset', authenticate, async (req, res) => {
   }
 });
 
-// Helper function to generate derivative
+// Helper function to generate derivative using new file storage
 async function generateDerivative(file, transformParams, transformKey) {
+  const client = await pool.connect();
+  
   try {
-    // Read original file - use filename instead of object_key
-    const uploadsDir = path.join(__dirname, '../uploads');
-    const filePath = path.join(uploadsDir, file.filename);
-    const inputBuffer = await fs.readFile(filePath);
+    await client.query('BEGIN');
+    
+    // Read original file from file_data table
+    const { getFileData } = require('../utils/fileStorage');
+    const inputBuffer = await getFileData(client, file.file_hash);
 
     // Apply transforms
     const result = await imageTransform.transformImage(inputBuffer, transformParams);
 
+    // Generate hash for derivative
+    const crypto = require('crypto');
+    const derivativeHash = crypto.createHash('sha256').update(result.buffer).digest('hex');
+    
+    // Store derivative data
+    const { storeFileData } = require('../utils/fileStorage');
+    await storeFileData(client, result.buffer, derivativeHash);
+
     // Generate derivative object key
     const derivativeKey = imageTransform.generateDerivativeKey(file.filename, transformKey);
-    const derivativePath = path.join(uploadsDir, derivativeKey);
-
-    // Ensure directory exists
-    await fs.mkdir(path.dirname(derivativePath), { recursive: true });
-
-    // Save derivative
-    await fs.writeFile(derivativePath, result.buffer);
 
     // Store derivative metadata in database
-    const derivativeResult = await pool.query(`
+    const derivativeResult = await client.query(`
       INSERT INTO image_derivatives (
         file_id, transform_spec, transform_key, 
-        object_key, mime_type, size, width, height, quality, format
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        object_key, file_hash, mime_type, size, width, height, quality, format
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *
     `, [
       file.id,
       JSON.stringify(transformParams),
       transformKey,
       derivativeKey,
+      derivativeHash,
       result.mimeType,
       result.size,
       result.metadata.width,
@@ -210,11 +213,15 @@ async function generateDerivative(file, transformParams, transformKey) {
       result.format
     ]);
 
+    await client.query('COMMIT');
     return derivativeResult.rows[0];
 
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Derivative generation error:', error);
     throw error;
+  } finally {
+    client.release();
   }
 }
 
