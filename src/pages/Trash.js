@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Trash2, RotateCcw, AlertTriangle, Clock, FileText, Image, Video, Music, Archive } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
-import api from '../services/api';
+import api, { filesAPI } from '../services/api';
 
 const Trash = () => {
   const [selectedFiles, setSelectedFiles] = useState([]);
@@ -10,20 +10,30 @@ const Trash = () => {
 
   const { data: trashData, isLoading, error } = useQuery({
     queryKey: ['trash'],
-    queryFn: () => api.get('/files/trash').then(res => res.data)
+    queryFn: () => filesAPI.getTrash().then(res => res.data)
   });
 
   const restoreMutation = useMutation({
-    mutationFn: (fileId) => api.post(`/files/${fileId}/restore`),
-    onSuccess: () => {
+    mutationFn: (fileId) => filesAPI.restore(fileId),
+    onSuccess: (data) => {
       queryClient.invalidateQueries(['trash']);
       queryClient.invalidateQueries(['files']);
+      queryClient.invalidateQueries(['buckets']);
       setSelectedFiles([]);
+      
+      // Show success message
+      const fileName = data.data.file?.original_name || 'File';
+      const bucketName = data.data.file?.bucket_name || 'bucket';
+      alert(`${fileName} has been restored to ${bucketName}`);
+    },
+    onError: (error) => {
+      const message = error.response?.data?.error || 'Failed to restore file';
+      alert(message);
     }
   });
 
   const permanentDeleteMutation = useMutation({
-    mutationFn: (fileId) => api.delete(`/files/${fileId}?permanent=true`),
+    mutationFn: (fileId) => filesAPI.delete(fileId, true),
     onSuccess: () => {
       queryClient.invalidateQueries(['trash']);
       setSelectedFiles([]);
@@ -92,6 +102,8 @@ const Trash = () => {
 
   const files = trashData?.files || [];
 
+
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -101,6 +113,8 @@ const Trash = () => {
             Files will be permanently deleted after 7 days
           </p>
         </div>
+        
+
         
         {files.length > 0 && (
           <div className="flex items-center space-x-3">
@@ -195,7 +209,11 @@ const Trash = () => {
                             {file.original_name}
                           </div>
                           <div className="text-sm text-gray-500 dark:text-gray-400">
-                            {file.bucket_name}
+                            {file.bucket_missing ? (
+                              <span className="text-red-500">Bucket deleted</span>
+                            ) : (
+                              file.bucket_name
+                            )}
                           </div>
                         </div>
                       </div>
@@ -226,9 +244,13 @@ const Trash = () => {
                         {!file.expired && (
                           <button
                             onClick={() => handleRestore(file.id)}
-                            disabled={restoreMutation.isPending}
-                            className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 disabled:opacity-50"
-                            title="Restore file"
+                            disabled={restoreMutation.isPending || file.bucket_missing}
+                            className={`disabled:opacity-50 ${
+                              file.bucket_missing 
+                                ? 'text-gray-400 cursor-not-allowed' 
+                                : 'text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300'
+                            }`}
+                            title={file.bucket_missing ? 'Cannot restore - bucket no longer exists' : 'Restore file'}
                           >
                             <RotateCcw className="w-4 h-4" />
                           </button>

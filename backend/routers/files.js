@@ -7,14 +7,17 @@ const analyticsService = require('../utils/analytics');
 
 const router = express.Router();
 
+
+
 // Get trash files (must be before /:fileId route)
 router.get('/trash', authenticate, async (req, res) => {
   try {
     const { cursor, limit = 20, sortBy = 'deleted_at', sortOrder = 'DESC' } = req.query;
 
     let query = `
-      SELECT f.id, f.original_name, f.size, f.mime_type, f.deleted_at, f.created_at,
-             COALESCE(b.name, 'Unknown') as bucket_name
+      SELECT f.id, f.bucket_id, f.original_name, f.size, f.mime_type, f.deleted_at, f.created_at,
+             COALESCE(b.name, 'Unknown') as bucket_name,
+             CASE WHEN b.id IS NULL THEN true ELSE false END as bucket_missing
       FROM files f
       LEFT JOIN buckets b ON f.bucket_id = b.id
       WHERE f.user_id = $1 AND f.deleted_at IS NOT NULL
@@ -41,6 +44,7 @@ router.get('/trash', authenticate, async (req, res) => {
     params.push(parseInt(limit) + 1);
 
     const result = await pool.query(query, params);
+    
     const files = result.rows.map(file => {
       const deletedAt = new Date(file.deleted_at);
       const restoreUntil = new Date(deletedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -63,6 +67,8 @@ router.get('/trash', authenticate, async (req, res) => {
       const lastFile = files[files.length - 1];
       nextCursor = lastFile[sortField];
     }
+
+
 
     res.json({
       files,
@@ -671,7 +677,8 @@ router.delete('/:fileId', authenticate, async (req, res) => {
     await client.query('BEGIN');
     
     const { fileId } = req.params;
-    const { permanent = false } = req.query;
+    const { permanent } = req.query;
+    const isPermanent = permanent === 'true' || permanent === true;
     
     // Get file info
     const fileResult = await client.query(
@@ -685,7 +692,7 @@ router.delete('/:fileId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    if (permanent || file.deleted_at) {
+    if (isPermanent || file.deleted_at) {
       // Permanent delete - cleanup file data
       const derivativesResult = await client.query(
         'SELECT file_hash FROM image_derivatives WHERE file_id = $1',
@@ -787,32 +794,67 @@ router.post('/:fileId/restore', authenticate, async (req, res) => {
     
     const { fileId } = req.params;
     
-    const result = await client.query(`
-      UPDATE files 
-      SET deleted_at = NULL
-      WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL 
-        AND deleted_at > (CURRENT_TIMESTAMP - INTERVAL '7 days')
-      RETURNING *
+    // Get file details with bucket info
+    const fileResult = await client.query(`
+      SELECT f.*, b.name as bucket_name, b.user_id as bucket_owner
+      FROM files f
+      LEFT JOIN buckets b ON f.bucket_id = b.id
+      WHERE f.id = $1 AND f.user_id = $2 AND f.deleted_at IS NOT NULL
     `, [fileId, req.user.id]);
 
-    if (!result.rows[0]) {
+    const file = fileResult.rows[0];
+    if (!file) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'File not found or restore period expired' });
+      return res.status(404).json({ error: 'File not found in trash' });
     }
 
-    const file = result.rows[0];
+    // Check if restore period has expired (7 days)
+    const deletedAt = new Date(file.deleted_at);
+    const restoreDeadline = new Date(deletedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+    if (new Date() > restoreDeadline) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        error: 'Restore period expired. Files can only be restored within 7 days of deletion.',
+        deletedAt: file.deleted_at,
+        restoreDeadline: restoreDeadline.toISOString()
+      });
+    }
+
+    // Verify bucket still exists and user has access
+    if (!file.bucket_name || file.bucket_owner !== req.user.id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        error: 'Cannot restore file: original bucket no longer exists or access denied'
+      });
+    }
+
+    // Restore the file by clearing deleted_at
+    const restoreResult = await client.query(`
+      UPDATE files 
+      SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, [fileId]);
+
+    const restoredFile = restoreResult.rows[0];
     
-    // Update bucket stats
-    await client.query(
-      'UPDATE buckets SET file_count = file_count + 1, storage_used = storage_used + $1 WHERE id = $2',
-      [file.size, file.bucket_id]
-    );
+    // Update bucket stats to reflect restored file
+    await client.query(`
+      UPDATE buckets 
+      SET file_count = COALESCE(file_count, 0) + 1, 
+          storage_used = COALESCE(storage_used, 0) + $1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [file.size, file.bucket_id]);
 
     await client.query('COMMIT');
     
     res.json({ 
       message: 'File restored successfully',
-      file
+      file: {
+        ...restoredFile,
+        bucket_name: file.bucket_name
+      }
     });
   } catch (error) {
     await client.query('ROLLBACK');

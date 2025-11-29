@@ -79,6 +79,7 @@ export const uploadAPI = {
 // Files API
 export const filesAPI = {
   getAll: (params = {}) => api.get('/files', { params }),
+  getTrash: (params = {}) => api.get('/files/trash', { params }),
   getBucketFiles: (bucketId, params = {}) => api.get(`/files/buckets/${bucketId}`, { params }),
   getById: (fileId) => api.get(`/files/${fileId}`),
   update: (fileId, updates) => api.put(`/files/${fileId}`, updates),
