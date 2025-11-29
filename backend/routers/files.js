@@ -351,12 +351,13 @@ router.post('/upload', authenticate, express.raw({ type: '*/*', limit: '100mb' }
 
     const isPublic = bucketResult.rows[0].is_public_by_default;
 
-    // Store file as Large Object
-    const loOid = await createLargeObject(client, req.body);
-    
     // Generate file hash
     const crypto = require('crypto');
     const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
+    
+    // Store file data in file_data table
+    const { storeFileData } = require('../utils/fileStorage');
+    await storeFileData(client, req.body, fileHash);
     
     // Get filename from headers or use default
     const originalName = req.headers['x-filename'] || 'uploaded-file';
@@ -375,8 +376,8 @@ router.post('/upload', authenticate, express.raw({ type: '*/*', limit: '100mb' }
     
     const result = await client.query(`
       INSERT INTO files 
-      (bucket_id, user_id, filename, original_name, mime_type, size, object_key, file_hash, lo_oid, is_public, created_by) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
+      (bucket_id, user_id, filename, original_name, mime_type, size, object_key, file_hash, is_public, created_by) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
       RETURNING *
     `, [
       bucket_id,
@@ -387,7 +388,6 @@ router.post('/upload', authenticate, express.raw({ type: '*/*', limit: '100mb' }
       req.body.length,
       `users/${req.user.id}/buckets/${bucket_id}/${Date.now()}-${originalName}`,
       fileHash,
-      loOid,
       isPublic,
       req.user.id
     ]);
@@ -444,6 +444,10 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
 
     const signedUrl = `${process.env.API_BASE_URL || 'http://localhost:5000'}/cdn/${file.object_key}?expires=${expiresAt.getTime()}&signature=${signature}&purpose=${purpose}`;
 
+    console.log('Generated signed URL:', signedUrl);
+    console.log('File object_key:', file.object_key);
+    console.log('File lo_oid:', file.lo_oid);
+
     // Determine cache headers based on versioning
     const cacheHeaders = file.version > 1 
       ? { 'Cache-Control': 'private, max-age=86400' } // 24 hours for versioned files
@@ -464,7 +468,7 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
   }
 });
 
-// Simple preview endpoint for images using Large Objects
+// Simple preview endpoint for images using file_data table
 router.get('/:fileId/preview', async (req, res) => {
   const client = await pool.connect();
   
@@ -489,13 +493,13 @@ router.get('/:fileId/preview', async (req, res) => {
     );
 
     const file = result.rows[0];
-    if (!file || !file.lo_oid) {
+    if (!file || !file.file_hash) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Read file from Large Object
-    const { readLargeObject } = require('../models/database');
-    const fileBuffer = await readLargeObject(client, file.lo_oid);
+    // Read file from file_data table
+    const { getFileData } = require('../utils/fileStorage');
+    const fileBuffer = await getFileData(client, file.file_hash);
 
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
@@ -538,7 +542,7 @@ router.get('/debug/list', async (req, res) => {
   }
 });
 
-// Direct download endpoint using Large Objects
+// Direct download endpoint using file_data table
 router.get('/:fileId/download', async (req, res) => {
   const client = await pool.connect();
   
@@ -563,13 +567,13 @@ router.get('/:fileId/download', async (req, res) => {
     );
 
     const file = result.rows[0];
-    if (!file || !file.lo_oid) {
+    if (!file || !file.file_hash) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Read file from Large Object
-    const { readLargeObject } = require('../models/database');
-    const fileBuffer = await readLargeObject(client, file.lo_oid);
+    // Read file from file_data table
+    const { getFileData } = require('../utils/fileStorage');
+    const fileBuffer = await getFileData(client, file.file_hash);
 
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
@@ -881,7 +885,7 @@ router.get('/:fileId/hash', authenticate, async (req, res) => {
   }
 });
 
-// Verify file integrity using Large Objects
+// Verify file integrity using file_data table
 router.post('/:fileId/verify', authenticate, async (req, res) => {
   const client = await pool.connect();
   
@@ -890,17 +894,18 @@ router.post('/:fileId/verify', authenticate, async (req, res) => {
     const { clientHash } = req.body;
     
     const result = await client.query(
-      'SELECT file_hash, lo_oid, original_name FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+      'SELECT file_hash, original_name FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
       [fileId, req.user.id]
     );
 
     const file = result.rows[0];
-    if (!file || !file.lo_oid) {
+    if (!file || !file.file_hash) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Re-compute server-side hash from Large Object
-    const fileBuffer = await readLargeObject(client, file.lo_oid);
+    // Re-compute server-side hash from file_data table
+    const { getFileData } = require('../utils/fileStorage');
+    const fileBuffer = await getFileData(client, file.file_hash);
     const computedHash = require('crypto')
       .createHash('sha256')
       .update(fileBuffer)

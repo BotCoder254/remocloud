@@ -1,5 +1,5 @@
 const express = require('express');
-const { pool, readLargeObject, createLargeObject } = require('../models/database');
+const { pool } = require('../models/database');
 const { authenticate } = require('../middleware/auth');
 const imageTransform = require('../utils/imageTransform');
 const crypto = require('crypto');
