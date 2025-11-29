@@ -67,8 +67,7 @@ router.get('/analytics/storage', authenticate, async (req, res) => {
 router.get('/analytics/top-files', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { limit = 10 } = req.query;
-    const topFiles = await analyticsService.getTopFiles(userId, parseInt(limit));
+    const topFiles = await analyticsService.getTopFiles(userId, 3);
     res.json(topFiles);
   } catch (error) {
     console.error('Top files analytics error:', error);
