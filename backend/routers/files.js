@@ -446,7 +446,7 @@ router.post('/:fileId/signed-url', authenticate, async (req, res) => {
 
     console.log('Generated signed URL:', signedUrl);
     console.log('File object_key:', file.object_key);
-    console.log('File lo_oid:', file.lo_oid);
+    console.log('File file_hash:', file.file_hash);
 
     // Determine cache headers based on versioning
     const cacheHeaders = file.version > 1 
@@ -613,34 +613,33 @@ router.delete('/:fileId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Get all derivatives for cleanup
+    // Delete derivatives from file_data table
     const derivativesResult = await client.query(
-      'SELECT lo_oid FROM image_derivatives WHERE file_id = $1',
+      'SELECT file_hash FROM image_derivatives WHERE file_id = $1',
       [fileId]
     );
 
-    // Delete derivatives Large Objects
-    const { deleteLargeObject } = require('../models/database');
+    const { deleteFileData } = require('../utils/fileStorage');
     for (const derivative of derivativesResult.rows) {
-      if (derivative.lo_oid) {
-        await deleteLargeObject(client, derivative.lo_oid);
+      if (derivative.file_hash) {
+        await deleteFileData(client, derivative.file_hash);
       }
     }
 
-    // Delete file Large Object
-    if (file.lo_oid) {
-      await deleteLargeObject(client, file.lo_oid);
+    // Delete file from file_data table
+    if (file.file_hash) {
+      await deleteFileData(client, file.file_hash);
     }
 
-    // Delete file versions Large Objects
+    // Delete file versions from file_data table
     const versionsResult = await client.query(
-      'SELECT lo_oid FROM file_versions WHERE file_id = $1',
+      'SELECT file_hash FROM file_versions WHERE file_id = $1',
       [fileId]
     );
     
     for (const version of versionsResult.rows) {
-      if (version.lo_oid) {
-        await deleteLargeObject(client, version.lo_oid);
+      if (version.file_hash) {
+        await deleteFileData(client, version.file_hash);
       }
     }
 
